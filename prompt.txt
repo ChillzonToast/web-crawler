@@ -1,0 +1,24 @@
+Analyze the following web page content and provide structured information:
+
+URL: {url}
+Content: {content}
+
+Please provide your analysis in the following format:
+
+Title: [Generate a suitable, descriptive title for this content - max 100 characters]
+
+Sensitivity: [Rate from 1-10 where:
+1-2: Public, boring content (generic articles, marketing fluff)
+3-4: Standard business content (company info, product descriptions)
+5-6: Moderately sensitive (internal processes, employee info)
+7-8: Highly sensitive (customer data, financial info, private documents)
+9-10: Extremely sensitive (complete databases, student records, medical records, passwords)]
+
+Summary: [Provide a concise 2-3 sentence summary of what the page contains and its main purpose]
+
+Instructions for analysis:
+- Focus on the actual content value and potential sensitivity
+- Consider if this information could be harmful if accessed by unauthorized persons  
+- Look for personal information, financial data, internal documents, databases
+- Rate higher if content contains lists of people, private information, or confidential data
+- Rate lower for public marketing content, general articles, or publicly available information
