@@ -14,17 +14,20 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class WebCrawlerAI:
-    def __init__(self, max_concurrent=5, delay_between_requests=1.0, output_file="crawled_data.json"):
+    def __init__(self, max_concurrent=5, delay_between_requests=1.0, output_file="crawled_data.json", queue_file="crawl_queue.json"):
         self.max_concurrent = max_concurrent
         self.delay_between_requests = delay_between_requests
         self.output_file = output_file
+        self.queue_file = queue_file
         self.visited_urls: Set[str] = set()
         self.crawled_data: List[Dict] = []
+        self.urls_to_crawl: List[str] = []  # Persistent queue
         self.session = None
         self.semaphore = asyncio.Semaphore(max_concurrent)
         
-        # Load existing data if file exists
+        # Load existing data and queue
         self.load_existing_data()
+        self.load_queue()
     
     def load_existing_data(self):
         """Load previously crawled data from JSON file"""
@@ -39,14 +42,36 @@ class WebCrawlerAI:
         except json.JSONDecodeError:
             logger.warning("Corrupted data file. Starting fresh.")
     
+    def load_queue(self):
+        """Load the crawl queue from JSON file"""
+        try:
+            with open(self.queue_file, 'r', encoding='utf-8') as f:
+                self.urls_to_crawl = json.load(f)
+            logger.info(f"Loaded {len(self.urls_to_crawl)} URLs from queue")
+        except FileNotFoundError:
+            logger.info("No existing queue file found. Starting with empty queue.")
+        except json.JSONDecodeError:
+            logger.warning("Corrupted queue file. Starting with empty queue.")
+    
     def save_data(self):
         """Save current data to JSON file"""
         try:
             with open(self.output_file, 'w', encoding='utf-8') as f:
+                # Sort by sensitivity level (highest first)
+                self.crawled_data.sort(key=lambda x: x['sensitivity_level'], reverse=True)
                 json.dump(self.crawled_data, f, indent=2, ensure_ascii=False)
             logger.info(f"Data saved to {self.output_file}")
         except Exception as e:
             logger.error(f"Error saving data: {e}")
+    
+    def save_queue(self):
+        """Save the current queue to JSON file"""
+        try:
+            with open(self.queue_file, 'w', encoding='utf-8') as f:
+                json.dump(self.urls_to_crawl, f, indent=2, ensure_ascii=False)
+            logger.info(f"Queue saved to {self.queue_file} ({len(self.urls_to_crawl)} URLs)")
+        except Exception as e:
+            logger.error(f"Error saving queue: {e}")
     
     def clean_text(self, text: str) -> str:
         """Clean and normalize text content"""
@@ -98,6 +123,16 @@ class WebCrawlerAI:
         except Exception as e:
             logger.error(f"Error extracting links from {base_url}: {e}")
             return []
+    
+    def should_crawl_url(self, url: str, allowed_domains: List[str] = None) -> bool:
+        """Check if URL should be crawled based on domain filtering"""
+        if not allowed_domains:
+            return True
+        
+        parsed_url = urlparse(url)
+        domain = parsed_url.netloc.lower()
+        
+        return any(allowed_domain.lower() in domain for allowed_domain in allowed_domains)
     
     async def analyze_with_ai(self, content: str, url: str) -> Dict:
         """Analyze content with AI to get title, sensitivity, and summary"""
@@ -224,7 +259,7 @@ class WebCrawlerAI:
                     self.crawled_data.append(result)
                     self.save_data()  # Save after each successful crawl
                     
-                    logger.info(f"Successfully crawled and analyzed: {url}")
+                    logger.info(f"Successfully crawled and analyzed: {url} (Sensitivity: {ai_analysis['sensitivity_level']})")
                     
                     # Extract links for further crawling
                     links = self.extract_links(html, url)
@@ -241,70 +276,110 @@ class WebCrawlerAI:
                 logger.error(f"Error crawling {url}: {e}")
                 return None
     
-    async def crawl_multiple(self, start_urls: List[str], max_pages: int = 100):
-        """Crawl multiple URLs with breadth-first approach"""
+    async def crawl_endless(self, start_urls: List[str] = None, allowed_domains: List[str] = None):
+        """Crawl URLs endlessly until manually stopped"""
         connector = aiohttp.TCPConnector(limit=self.max_concurrent)
         async with aiohttp.ClientSession(connector=connector) as session:
             self.session = session
             
-            urls_to_crawl = list(start_urls)
-            crawled_count = 0
+            # Add start URLs to queue if provided and queue is empty
+            if start_urls and not self.urls_to_crawl:
+                self.urls_to_crawl.extend(start_urls)
+                logger.info(f"Added {len(start_urls)} start URLs to queue")
             
-            while urls_to_crawl and crawled_count < max_pages:
-                # Take batch of URLs
-                current_batch = urls_to_crawl[:self.max_concurrent]
-                urls_to_crawl = urls_to_crawl[self.max_concurrent:]
-                
-                # Filter out already visited URLs
-                current_batch = [url for url in current_batch if url not in self.visited_urls]
-                
-                if not current_batch:
-                    continue
-                
-                # Crawl batch concurrently
-                tasks = [self.crawl_url(url) for url in current_batch]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Process results
-                new_links = []
-                for result in results:
-                    if isinstance(result, dict) and result:
-                        crawled_count += 1
-                        # Add new links to queue
-                        if "extracted_links" in result:
-                            new_links.extend(result["extracted_links"])
-                
-                # Add new unique links to crawl queue
-                for link in new_links:
-                    if link not in self.visited_urls and link not in urls_to_crawl:
-                        # Simple same-domain filter (optional)
-                        if len(start_urls) == 1:
-                            start_domain = urlparse(start_urls[0]).netloc
-                            link_domain = urlparse(link).netloc
-                            if start_domain == link_domain:
-                                urls_to_crawl.append(link)
-                        else:
-                            urls_to_crawl.append(link)
-                
-                logger.info(f"Crawled: {crawled_count}, Queue: {len(urls_to_crawl)}")
-                
-                if crawled_count % 10 == 0:
-                    logger.info(f"Progress: {crawled_count} pages crawled")
+            crawled_count = len(self.visited_urls)  # Start from existing count
+            
+            try:
+                while True:  # Endless loop
+                    # Check if queue is empty
+                    if not self.urls_to_crawl:
+                        logger.warning("Queue is empty! Waiting for new URLs...")
+                        await asyncio.sleep(10)
+                        continue
+                    
+                    # Take batch of URLs from the front of queue
+                    batch_size = min(self.max_concurrent, len(self.urls_to_crawl))
+                    current_batch = self.urls_to_crawl[:batch_size]
+                    self.urls_to_crawl = self.urls_to_crawl[batch_size:]  # Remove from queue
+                    
+                    # Filter out already visited URLs and domain restrictions
+                    current_batch = [
+                        url for url in current_batch 
+                        if url not in self.visited_urls and self.should_crawl_url(url, allowed_domains)
+                    ]
+                    
+                    if not current_batch:
+                        continue
+                    
+                    # Crawl batch concurrently
+                    tasks = [self.crawl_url(url) for url in current_batch]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Process results and add new links to queue
+                    new_links = []
+                    successful_crawls = 0
+                    
+                    for result in results:
+                        if isinstance(result, dict) and result:
+                            successful_crawls += 1
+                            crawled_count += 1
+                            # Add new links to queue
+                            if "extracted_links" in result:
+                                new_links.extend(result["extracted_links"])
+                    
+                    # Add new unique links to crawl queue
+                    unique_new_links = []
+                    for link in new_links:
+                        if (link not in self.visited_urls and 
+                            link not in self.urls_to_crawl and 
+                            link not in unique_new_links and
+                            self.should_crawl_url(link, allowed_domains)):
+                            unique_new_links.append(link)
+                    
+                    self.urls_to_crawl.extend(unique_new_links)
+                    
+                    # Save queue periodically
+                    if crawled_count % 10 == 0:
+                        self.save_queue()
+                    
+                    # Log progress
+                    logger.info(f"Crawled: {crawled_count}, Queue: {len(self.urls_to_crawl)}, New links: {len(unique_new_links)}")
+                    
+                    # Progress milestone
+                    if crawled_count % 50 == 0:
+                        logger.info(f"MILESTONE: {crawled_count} pages crawled, {len(self.urls_to_crawl)} URLs in queue")
+                        # Save queue at milestones
+                        self.save_queue()
+            
+            except KeyboardInterrupt:
+                logger.info("Crawling interrupted by user")
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+            finally:
+                # Always save queue before exiting
+                self.save_queue()
+                logger.info(f"Crawling stopped. Total crawled: {crawled_count}, Queue preserved: {len(self.urls_to_crawl)}")
 
 # Usage example
 async def main():
-    crawler = WebCrawlerAI(max_concurrent=5, delay_between_requests=1.0)
+    crawler = WebCrawlerAI(max_concurrent=5, delay_between_requests=0.5)
     
-    # Starting URLs
+    # Starting URLs (only needed if starting fresh)
     start_urls = [
         "https://nitc.ac.in/",
         "https://minerva.nitc.ac.in/",
         "https://athena.nitc.ac.in/"
     ]
     
-    await crawler.crawl_multiple(start_urls, max_pages=50)
+    # Domain filtering to stay within specific domains
+    allowed_domains = [
+        "nitc.ac.in",
+        "minerva.nitc.ac.in", 
+        "athena.nitc.ac.in"
+    ]
     
-    logger.info(f"Crawling completed. Total pages: {len(crawler.crawled_data)}")
+    # Start endless crawling
+    await crawler.crawl_endless(start_urls, allowed_domains)
 
 if __name__ == "__main__":
     asyncio.run(main())
