@@ -362,7 +362,7 @@ class WebCrawlerAI:
 
 # Usage example
 async def main():
-    crawler = WebCrawlerAI(max_concurrent=5, delay_between_requests=0.5)
+    crawler = WebCrawlerAI(max_concurrent=25, delay_between_requests=0)
     
     # Starting URLs (only needed if starting fresh)
     start_urls = [
